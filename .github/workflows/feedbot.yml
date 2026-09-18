@@ -3,33 +3,29 @@ on:
   schedule:
     - cron: '*/30 * * * *'   # every 30 minutes
   workflow_dispatch:
+permissions:
+  contents: write   # lets the bot save its list of posted items
 concurrency:
   group: feedbot
 jobs:
   rss-to-bluesky:
     runs-on: ubuntu-latest
     steps:
-      - name: Generate cache key
-        uses: actions/github-script@v7
-        id: generate-key
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
-          script: |
-            core.setOutput('cache-key', new Date().valueOf())
-      - name: Retrieve cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/blueskyfeedbot
-          key: feed-cache-${{ steps.generate-key.outputs.cache-key }}
-          restore-keys: feed-cache-
+          python-version: '3.12'
+      - name: Install libraries
+        run: pip install atproto feedparser beautifulsoup4 pillow requests
       - name: Post new feed items to Bluesky
-        uses: joschi/blueskyfeedbot@v1
-        with:
-          rss-feed: https://theoldreader.com/profile/19f3e2b78dcc6a81ae1cc236.rss
-          template: |
-            {{item.title}}
-
-            {{item.link}}
-          username: ${{ secrets.BLUESKY_USERNAME }}
-          password: ${{ secrets.BLUESKY_PASSWORD }}
-          cache-file: ${{ github.workspace }}/blueskyfeedbot/cache.json
-          initial-post-limit: 1
+        run: python bot.py
+        env:
+          BLUESKY_USERNAME: ${{ secrets.BLUESKY_USERNAME }}
+          BLUESKY_PASSWORD: ${{ secrets.BLUESKY_PASSWORD }}
+      - name: Save list of posted items
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898232+github-actions[bot]@users.noreply.github.com"
+          git add seen.json
+          git diff --cached --quiet || (git commit -m "Update posted items" && git push)
