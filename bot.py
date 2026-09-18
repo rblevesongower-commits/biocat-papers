@@ -3,7 +3,6 @@ import html
 import io
 import json
 import os
-import time
 
 import feedparser
 import requests
@@ -13,9 +12,11 @@ from PIL import Image
 
 FEED = "https://theoldreader.com/profile/19f3e2b78dcc6a81ae1cc236.rss"
 SEEN_FILE = "seen.json"
+FAILED_FILE = "failed.json"  # retry counts for items that failed to post
+MAX_ATTEMPTS = 3
 MAX_POSTS_PER_RUN = 5
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
-BACKFILL = int(os.environ.get("BACKFILL") or 0)  # one-off: post the latest N items
+KEEP_SEEN = 2000  # how many posted-item IDs to remember
 UA = ("Mozilla/5.0 (compatible; biocat-papers-bot/1.0; "
       "+https://bsky.app/profile/biocat-papers.bsky.social)")
 
@@ -28,8 +29,9 @@ def load_seen():
 
 
 def save_seen(seen):
+    # seen is a list in the order items were recorded; keep only the most recent IDs
     with open(SEEN_FILE, "w") as f:
-        json.dump(sorted(seen), f, indent=0)
+        json.dump(list(dict.fromkeys(seen))[-KEEP_SEEN:], f, indent=0)
 
 
 def trim(text, n):
@@ -83,80 +85,77 @@ def thumbnail(client, img_url):
         return None
 
 
-def already_posted(client):
-    """Links the account has already posted, so a backfill never duplicates a post."""
-    links, texts, cursor = set(), [], None
-    while True:
-        r = client.get_author_feed(actor=client.me.did, cursor=cursor, limit=100)
-        for item in r.feed:
-            rec = item.post.record
-            texts.append(rec.text or "")
-            ext = getattr(getattr(rec, "embed", None), "external", None)
-            if ext:
-                links.add(ext.uri)
-            for facet in rec.facets or []:
-                for feat in facet.features:
-                    if getattr(feat, "uri", None):
-                        links.add(feat.uri)
-        cursor = r.cursor
-        if not cursor:
-            return links, texts
+def keys(e):
+    """An item counts as posted if either its feed ID or its link was recorded."""
+    return {k for k in (e.get("id"), e.get("link")) if k}
 
 
 def main():
     feed = feedparser.parse(FEED, agent=UA)
+    if not feed.entries:
+        print(f"Feed returned no items (status {feed.get('status')}); trying again next run.")
+        return
     entries = list(reversed(feed.entries))  # oldest first
     print(f"{len(entries)} items in feed")
 
     seen = load_seen()
-    if seen is None and not BACKFILL:
+    if seen is None:
         # First run: remember what's already in the feed, post nothing.
-        save_seen({e.get("id") or e.link for e in entries})
+        save_seen([k for e in entries for k in keys(e)])
         print("First run: recorded existing items, nothing posted.")
         return
-    seen = set(seen or [])
+    seen_set = set(seen)
+
+    # Oldest unposted items first; anything over the limit waits for the next run.
+    new = [e for e in entries if not keys(e) & seen_set][:MAX_POSTS_PER_RUN]
+    if not new:
+        print("Nothing new.")
+        return
 
     client = None
     if not DRY_RUN:
         client = Client()
         client.login(os.environ["BLUESKY_USERNAME"], os.environ["BLUESKY_PASSWORD"])
 
-    if BACKFILL:
-        links, texts = already_posted(client) if client else (set(), [])
-        new = []
-        for e in entries[-BACKFILL:]:
-            if e.link in links or any(e.link in t for t in texts):
-                print(f"Already on Bluesky, skipping: {e.title}")
-                seen.add(e.get("id") or e.link)
-            else:
-                new.append(e)
-        print(f"Backfill: posting {len(new)} items, oldest first")
-    else:
-        new = [e for e in entries if (e.get("id") or e.link) not in seen][-MAX_POSTS_PER_RUN:]
-    if not new:
-        save_seen(seen)
-        print("Nothing new.")
-        return
-
+    attempts = json.load(open(FAILED_FILE)) if os.path.exists(FAILED_FILE) else {}
+    failures = 0
     for e in new:
-        uid = e.get("id") or e.link
         print(f"Posting: {e.title}")
-        og_title, og_desc, og_img = page_preview(e.link)
-        card = models.AppBskyEmbedExternal.External(
-            uri=e.link,
-            title=trim(og_title or e.title, 300),
-            description=trim(og_desc or BeautifulSoup(e.get("summary", ""), "html.parser").get_text(), 500),
-            thumb=thumbnail(client, og_img) if og_img else None,
-        )
-        text = trim(e.title, 300)
-        if DRY_RUN:
-            print(f"  [dry run] text={text!r}\n  card title={card.title!r}")
-        else:
-            client.send_post(text=text, embed=models.AppBskyEmbedExternal.Main(external=card))
-        seen.add(uid)
+        try:
+            og_title, og_desc, og_img = page_preview(e.link)
+            card = models.AppBskyEmbedExternal.External(
+                uri=e.link,
+                title=trim(og_title or e.title, 300),
+                description=trim(og_desc or BeautifulSoup(e.get("summary", ""), "html.parser").get_text(), 500),
+                thumb=thumbnail(client, og_img) if og_img else None,
+            )
+            text = trim(e.title, 300)
+            if DRY_RUN:
+                print(f"  [dry run] text={text!r}\n  card title={card.title!r}")
+            else:
+                client.send_post(text=text, embed=models.AppBskyEmbedExternal.Main(external=card))
+        except Exception as err:  # skip this one, retry it next run, keep going
+            n = attempts[e.link] = attempts.get(e.link, 0) + 1
+            print(f"  FAILED (attempt {n} of {MAX_ATTEMPTS}): {err}")
+            if n < MAX_ATTEMPTS:
+                failures += 1
+            else:
+                print("  Giving up on this item.")
+                del attempts[e.link]
+                seen.extend(keys(e))
+                save_seen(seen)
+            with open(FAILED_FILE, "w") as f:
+                json.dump(attempts, f, indent=0)
+            continue
+        attempts.pop(e.link, None)
+        seen.extend(keys(e))
         save_seen(seen)  # save after each post so a failure never causes a repost
-        if BACKFILL:
-            time.sleep(3)  # pace the backfill gently
+
+    if attempts or os.path.exists(FAILED_FILE):
+        with open(FAILED_FILE, "w") as f:
+            json.dump(attempts, f, indent=0)
+    if failures:
+        raise SystemExit(f"{failures} item(s) failed to post; they will be retried next run.")
 
 
 if __name__ == "__main__":
