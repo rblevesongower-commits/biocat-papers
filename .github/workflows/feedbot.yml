@@ -1,0 +1,35 @@
+name: FeedBot
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes
+  workflow_dispatch:
+concurrency:
+  group: feedbot
+jobs:
+  rss-to-bluesky:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate cache key
+        uses: actions/github-script@v7
+        id: generate-key
+        with:
+          script: |
+            core.setOutput('cache-key', new Date().valueOf())
+      - name: Retrieve cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/blueskyfeedbot
+          key: feed-cache-${{ steps.generate-key.outputs.cache-key }}
+          restore-keys: feed-cache-
+      - name: Post new feed items to Bluesky
+        uses: joschi/blueskyfeedbot@v1
+        with:
+          rss-feed: https://theoldreader.com/profile/19f3e2b78dcc6a81ae1cc236.rss
+          template: |
+            {{item.title}}
+
+            {{item.link}}
+          username: ${{ secrets.BLUESKY_USERNAME }}
+          password: ${{ secrets.BLUESKY_PASSWORD }}
+          cache-file: ${{ github.workspace }}/blueskyfeedbot/cache.json
+          initial-post-limit: 1
