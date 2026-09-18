@@ -1,7 +1,7 @@
 name: FeedBot
 on:
   schedule:
-    - cron: '*/30 * * * *'   # every 30 minutes
+    - cron: '17,47 * * * *'   # every 30 minutes, off the busy :00/:30 slots
   workflow_dispatch:
 permissions:
   contents: write   # lets the bot save its list of posted items
