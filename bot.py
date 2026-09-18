@@ -3,6 +3,7 @@ import html
 import io
 import json
 import os
+import re
 
 import feedparser
 import requests
@@ -17,6 +18,8 @@ MAX_ATTEMPTS = 3
 MAX_POSTS_PER_RUN = 5
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 KEEP_SEEN = 2000  # how many posted-item IDs to remember
+CARD_API = "https://cardyb.bsky.app/v1/extract?url="  # Bluesky's own link-card service
+JUNK_IMG = re.compile(r"logo|favicon|placeholder|default[-_]?image|\.svg", re.I)
 UA = ("Mozilla/5.0 (compatible; biocat-papers-bot/1.0; "
       "+https://bsky.app/profile/biocat-papers.bsky.social)")
 
@@ -37,6 +40,59 @@ def save_seen(seen):
 def trim(text, n):
     text = " ".join(html.unescape(text or "").split())
     return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def words(text):
+    return set(re.findall(r"[a-z0-9]{4,}", (text or "").lower()))
+
+
+def matches(title, feed_title):
+    """True if a scraped title is really this article (not a cookie wall or home page)."""
+    a, b = words(title), words(feed_title)
+    return bool(a and b) and len(a & b) / min(len(a), len(b)) >= 0.5
+
+
+def good_image(url):
+    return bool(url) and url.startswith("http") and not JUNK_IMG.search(url)
+
+
+def feed_image(e):
+    """Graphical abstract embedded in the feed item itself (Wiley, RSC and others do this)."""
+    html_parts = [e.get("summary", "")] + [c.get("value", "") for c in e.get("content", [])]
+    for img in BeautifulSoup(" ".join(html_parts), "html.parser").find_all("img"):
+        if good_image(img.get("src")):
+            return img["src"]
+    for m in e.get("media_content", []) + e.get("media_thumbnail", []):
+        if good_image(m.get("url")):
+            return m["url"]
+    return None
+
+
+def bluesky_card(url):
+    """Ask Bluesky's link-card service, which can reach some sites that block GitHub."""
+    try:
+        d = requests.get(CARD_API + requests.utils.quote(url, safe=""), timeout=20).json()
+        return d.get("title") or None, d.get("description") or None, d.get("image") or None
+    except Exception as e:
+        print(f"  card service failed: {e}")
+        return None, None, None
+
+
+def preview(e):
+    """Best (title, description, image) for an item, preferring TOC graphics."""
+    title, desc, img = None, None, feed_image(e)
+    for source in (page_preview, bluesky_card):
+        t, d, i = source(e.link)
+        if not matches(t, e.title):
+            continue  # cookie wall, login page, journal home page...
+        title, desc = title or t, desc or d
+        if not img and good_image(i):
+            img = i
+        if title and img:
+            break
+    summary = BeautifulSoup(e.get("summary", ""), "html.parser").get_text(" ")
+    summary = re.sub(r"^\s*(Abstract|The Front Cover|Graphical Abstract)\s*", "", summary)
+    return title or e.title, desc or summary, img
 
 
 def page_preview(url):
@@ -67,8 +123,15 @@ def page_preview(url):
 def thumbnail(client, img_url):
     """Download the preview image, shrink it under Bluesky's 1 MB limit, upload it."""
     try:
-        r = requests.get(img_url, headers={"User-Agent": UA}, timeout=20)
-        r.raise_for_status()
+        try:
+            r = requests.get(img_url, headers={"User-Agent": UA}, timeout=20)
+            r.raise_for_status()
+        except Exception:
+            if "cardyb.bsky.app" in img_url:
+                raise
+            # some publishers block GitHub's servers; retry through Bluesky's image proxy
+            r = requests.get("https://cardyb.bsky.app/v1/image?url=" + requests.utils.quote(img_url, safe=""), timeout=20)
+            r.raise_for_status()
         im = Image.open(io.BytesIO(r.content)).convert("RGB")
         im.thumbnail((1200, 1200))
         for q in (85, 75, 65, 50):
@@ -122,12 +185,13 @@ def main():
     for e in new:
         print(f"Posting: {e.title}")
         try:
-            og_title, og_desc, og_img = page_preview(e.link)
+            title, desc, img = preview(e)
+            print(f"  image: {img or 'none found'}")
             card = models.AppBskyEmbedExternal.External(
                 uri=e.link,
-                title=trim(og_title or e.title, 300),
-                description=trim(og_desc or BeautifulSoup(e.get("summary", ""), "html.parser").get_text(), 500),
-                thumb=thumbnail(client, og_img) if og_img else None,
+                title=trim(title, 300),
+                description=trim(desc, 500),
+                thumb=thumbnail(client, img) if img else None,
             )
             text = trim(e.title, 300)
             if DRY_RUN:
