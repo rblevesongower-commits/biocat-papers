@@ -3,6 +3,10 @@ on:
   schedule:
     - cron: '*/30 * * * *'   # every 30 minutes
   workflow_dispatch:
+    inputs:
+      backfill:
+        description: 'One-off: post the latest N feed items (0 = normal run)'
+        default: '0'
 permissions:
   contents: write   # lets the bot save its list of posted items
 concurrency:
@@ -22,6 +26,7 @@ jobs:
         env:
           BLUESKY_USERNAME: ${{ secrets.BLUESKY_USERNAME }}
           BLUESKY_PASSWORD: ${{ secrets.BLUESKY_PASSWORD }}
+          BACKFILL: ${{ inputs.backfill || '0' }}
       - name: Save list of posted items
         if: always()
         run: |
